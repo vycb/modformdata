@@ -12,6 +12,7 @@ extern crate hyper;
 extern crate mime;
 extern crate tempdir;
 extern crate textnonce;
+use std::rc::Rc;
 #[macro_use]
 extern crate log;
 
@@ -51,6 +52,7 @@ pub struct UploadedFile {
     pub size: usize,
     // The temporary directory the upload was put into, saved for the Drop trait
     tempdir: PathBuf,
+    pub data: Option<Rc<Vec<u8>>>
 }
 
 impl UploadedFile {
@@ -65,6 +67,7 @@ impl UploadedFile {
             content_type: content_type,
             size: 0,
             tempdir: tempdir,
+            data: None
         })
     }
 }
@@ -99,10 +102,10 @@ impl FormData {
 ///
 /// The request is streamed, and this function saves embedded uploaded files to disk as they are
 /// encountered by the parser.
-pub fn parse_multipart<S: Read>(stream: &mut S, boundary: String, fs: &Fn(Box<&Vec<u8>>)->bool) -> Result<FormData, Error> {
+pub fn parse_multipart<S: Read>(stream: &mut S, boundary: String, send: bool) -> Result<FormData, Error> {
     let mut reader = BufReader::with_capacity(4096, stream);
     let mut form_data = FormData::new();
-    try!(run_state_machine(boundary, &mut reader, &mut form_data, MultipartSubLevel::FormData, &fs));
+    try!(run_state_machine(boundary, &mut reader, &mut form_data, MultipartSubLevel::FormData, send));
     Ok(form_data)
 }
 
@@ -131,12 +134,12 @@ enum MultipartSubLevel {
 
 // Parse either a `multipart/form-data` or `multipart/mixed` MIME body.
 fn run_state_machine<R: BufRead>(boundary: String, reader: &mut R, form_data: &mut FormData,
-                                 mode: MultipartSubLevel, fs: &Fn(Box<&Vec<u8>>)->bool) -> Result<(), Error> {
+                                 mode: MultipartSubLevel, send: bool) -> Result<(), Error> {
     use State::*;
     use MultipartSubLevel::*;
 
     let boundary = boundary.into_bytes();
-    let crlf_boundary = crlf_boundary(&boundary);
+    let crlf_boundary = Rc::new(crlf_boundary(&boundary));
     let mut state = Discarding;
 
     loop {
@@ -212,7 +215,7 @@ fn run_state_machine<R: BufRead>(boundary: String, reader: &mut R, form_data: &m
             CapturingMixed(cd, ct) => {
                 let boundary = try!(get_boundary_token(&(ct.0).2));
                 let mode = Mixed(try!(cd.name.ok_or(Error::NoName)));
-                try!(run_state_machine(boundary, reader, form_data, mode, &fs));
+                try!(run_state_machine(boundary, reader, form_data, mode, send));
                 state = Discarding;
             },
             CapturingValue(_) if mode != FormData => unreachable!(),
@@ -228,27 +231,31 @@ fn run_state_machine<R: BufRead>(boundary: String, reader: &mut R, form_data: &m
                 state = ReadingHeaders;
             },
             CapturingFile(cd, ct) => {
-            	if fs(box &crlf_boundary) {
-                // Setup a file to capture the contents.
-	                let mut uploaded_file = try!(UploadedFile::new(
-	                    ct.map_or(mime!(Text/Plain; Charset=Utf8), |ct| ct.0)));
-	                uploaded_file.filename = cd.filename.clone();
+            	// Setup a file to capture the contents.
+                let mut uploaded_file = try!(UploadedFile::new(
+                    ct.map_or(mime!(Text/Plain; Charset=Utf8), |ct| ct.0)));
+                uploaded_file.filename = cd.filename.clone();
+                
+            	if send {
+            		uploaded_file.data = Some(crlf_boundary.clone());
+	                uploaded_file.size = crlf_boundary.len();
+            	}
+            	else{
 	                let mut file = try!(File::create(uploaded_file.path.clone()));
 	
 	                // Stream out the file.
 	                let read = try!(reader.stream_until_token(&crlf_boundary, &mut file));
 	                uploaded_file.size = read - crlf_boundary.len();
-	
-	                // TODO: Handle Content-Transfer-Encoding.
-	
-	                let key = match mode {
-	                    Mixed(ref name) => name.clone(),
-	                    FormData => try!(cd.name.ok_or(Error::NoName)),
-	                };
-	
-	                form_data.files.push((key, uploaded_file));
             	}
-                state = ReadingHeaders;
+
+                // TODO: Handle Content-Transfer-Encoding.
+                let key = match mode {
+                    Mixed(ref name) => name.clone(),
+                    FormData => try!(cd.name.ok_or(Error::NoName)),
+                };
+
+                form_data.files.push((key, uploaded_file));
+            	state = ReadingHeaders;
             },
         }
     }
@@ -352,9 +359,7 @@ mod tests {
         let sock: SocketAddr = "127.0.0.1:80".parse().unwrap();
         let mut req = HyperRequest::new(&mut stream, sock).unwrap();
         let boundary = get_multipart_boundary(&req.headers).unwrap();
-		let mut ct : Box<&Vec<u8>>;
-		let fs = |c: Box<&Vec<u8>>| { ct = box*c; return true};
-        match parse_multipart(&mut req, boundary, &fs) {
+        match parse_multipart(&mut req, boundary, false) {
             Ok(form_data) => {
                 assert_eq!(form_data.fields.len(), 1);
                 for (key, val) in form_data.fields {
@@ -416,9 +421,7 @@ mod tests {
         let mut req = HyperRequest::new(&mut stream, sock).unwrap();
         let boundary = get_multipart_boundary(&req.headers).unwrap();
 		
-		let mut ct : Box<&Vec<u8>>;
-		let fs = |c: Box<&Vec<u8>>| { ct = box *c; return true};
-        match parse_multipart(&mut req, boundary, &fs) {
+        match parse_multipart(&mut req, boundary, false) {
             Ok(form_data) => {
                 assert_eq!(form_data.fields.len(), 1);
                 for (key, val) in form_data.fields {
