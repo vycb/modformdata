@@ -12,7 +12,6 @@ extern crate hyper;
 extern crate mime;
 extern crate tempdir;
 extern crate textnonce;
-use std::rc::Rc;
 #[macro_use]
 extern crate log;
 
@@ -25,7 +24,7 @@ mod mock;
 use std::path::PathBuf;
 use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
-use std::ops::Drop;
+//use std::ops::Drop;
 
 use hyper::header::{ContentType, Headers};
 use mime::{Attr, Mime, Param, SubLevel, TopLevel, Value};
@@ -52,7 +51,7 @@ pub struct UploadedFile {
     pub size: usize,
     // The temporary directory the upload was put into, saved for the Drop trait
     tempdir: PathBuf,
-    pub data: Option<Rc<Vec<u8>>>
+    pub data: Vec<u8>
 }
 
 impl UploadedFile {
@@ -67,17 +66,17 @@ impl UploadedFile {
             content_type: content_type,
             size: 0,
             tempdir: tempdir,
-            data: None
+            data: vec![]
         })
     }
 }
-
-impl Drop for UploadedFile {
-    fn drop(&mut self) {
-        let _ = ::std::fs::remove_file(&self.path);
-        let _ = ::std::fs::remove_dir(&self.tempdir);
-    }
-}
+//
+//impl Drop for UploadedFile {
+//    fn drop(&mut self) {
+//        let _ = ::std::fs::remove_file(&self.path);
+//        let _ = ::std::fs::remove_dir(&self.tempdir);
+//    }
+//}
 
 /// The extracted text fields and uploaded files from a `multipart/form-data` request.
 ///
@@ -139,7 +138,7 @@ fn run_state_machine<R: BufRead>(boundary: String, reader: &mut R, form_data: &m
     use MultipartSubLevel::*;
 
     let boundary = boundary.into_bytes();
-    let crlf_boundary = Rc::new(crlf_boundary(&boundary));
+    let crlf_boundary = crlf_boundary(&boundary);
     let mut state = Discarding;
 
     loop {
@@ -235,18 +234,18 @@ fn run_state_machine<R: BufRead>(boundary: String, reader: &mut R, form_data: &m
                 let mut uploaded_file = try!(UploadedFile::new(
                     ct.map_or(mime!(Text/Plain; Charset=Utf8), |ct| ct.0)));
                 uploaded_file.filename = cd.filename.clone();
-                
-            	if send {
-            		uploaded_file.data = Some(crlf_boundary.clone());
-	                uploaded_file.size = crlf_boundary.len();
-            	}
+                let read;
+            	if !send {
+                	let mut file = try!(File::create(uploaded_file.path.clone()));
+                	// Stream out the file.
+                	read = try!(reader.stream_until_token(&crlf_boundary, &mut file ));
+				}
             	else{
-	                let mut file = try!(File::create(uploaded_file.path.clone()));
-	
-	                // Stream out the file.
-	                let read = try!(reader.stream_until_token(&crlf_boundary, &mut file));
-	                uploaded_file.size = read - crlf_boundary.len();
+	                
+	                read = try!(reader.stream_until_token(&crlf_boundary, &mut uploaded_file.data ));
             	}
+	            
+	            uploaded_file.size = read - crlf_boundary.len();
 
                 // TODO: Handle Content-Transfer-Encoding.
                 let key = match mode {
